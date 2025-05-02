@@ -1,11 +1,17 @@
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QComboBox,
-    QTableView, QLineEdit, QLabel, QHeaderView, QMessageBox, QInputDialog, QDialog
+    QTableView, QLineEdit, QLabel, QHeaderView, QMessageBox, QInputDialog, QDialog,
+    QRadioButton, QGroupBox, QDateEdit
 )
 from PyQt5.QtCore import Qt, QAbstractTableModel
-from sqlalchemy import create_engine, MetaData, Table, select, or_
+from sqlalchemy import create_engine, MetaData, Table, select, or_, func, text, and_
 from sqlalchemy.orm import sessionmaker
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import numpy as np
+from datetime import datetime, timedelta
 
 # СТРОКА ПОДКЛЮЧЕНИЯ
 DB_URL = "postgresql+psycopg2://Zona:qwerty@localhost:5432/Hotel_db"
@@ -20,6 +26,255 @@ rooms_table = Table('rooms', metadata, autoload_with=engine)
 room_categories_table = Table('roomcategories', metadata, autoload_with=engine)
 services_table = Table('services', metadata, autoload_with=engine)
 bookings_table = Table('bookings', metadata, autoload_with=engine)
+
+class ChartsWindow(QDialog):
+    """Окно для построения графиков"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Графики")
+        self.resize(800, 600)
+        self.init_ui()
+        
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Верхняя часть с выбором типа графика
+        chart_type_group = QGroupBox("Тип графика")
+        chart_type_layout = QHBoxLayout()
+        
+        self.rb_histogram = QRadioButton("Гистограмма")
+        self.rb_linear = QRadioButton("Линейный график")
+        self.rb_pie = QRadioButton("Круговая диаграмма")
+        
+        self.rb_histogram.setChecked(True)  # По умолчанию выбрана гистограмма
+        
+        chart_type_layout.addWidget(self.rb_histogram)
+        chart_type_layout.addWidget(self.rb_linear)
+        chart_type_layout.addWidget(self.rb_pie)
+        chart_type_group.setLayout(chart_type_layout)
+        layout.addWidget(chart_type_group)
+        
+        # Выбор данных для графика
+        data_group = QGroupBox("Данные для графика")
+        data_layout = QHBoxLayout()
+        
+        self.rb_room_occupancy = QRadioButton("Заселяемость номеров")
+        self.rb_custom = QRadioButton("Статистика по категориям номеров")
+        
+        self.rb_room_occupancy.setChecked(True)  # По умолчанию выбрана заселяемость
+        
+        data_layout.addWidget(self.rb_room_occupancy)
+        data_layout.addWidget(self.rb_custom)
+        data_group.setLayout(data_layout)
+        layout.addWidget(data_group)
+        
+        # Выбор периода
+        period_group = QGroupBox("Период")
+        period_layout = QHBoxLayout()
+        
+        period_layout.addWidget(QLabel("От:"))
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(datetime.now().date() - timedelta(days=30))  # По умолчанию 30 дней назад
+        period_layout.addWidget(self.date_from)
+        
+        period_layout.addWidget(QLabel("До:"))
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(datetime.now().date())  # По умолчанию сегодня
+        period_layout.addWidget(self.date_to)
+        
+        period_group.setLayout(period_layout)
+        layout.addWidget(period_group)
+        
+        # Область для отображения графика
+        self.figure = Figure(figsize=(5, 4), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        layout.addWidget(self.canvas)
+        
+        # Кнопки управления
+        buttons_layout = QHBoxLayout()
+        self.btn_generate = QPushButton("Построить график")
+        self.btn_generate.clicked.connect(self.generate_chart)
+        self.btn_close = QPushButton("Закрыть")
+        self.btn_close.clicked.connect(self.close)
+        
+        buttons_layout.addWidget(self.btn_generate)
+        buttons_layout.addWidget(self.btn_close)
+        layout.addLayout(buttons_layout)
+    
+    def generate_chart(self):
+        """Генерация и отображение графика на основе выбранных параметров"""
+        try:
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            
+            # Получаем выбранные даты
+            date_from = self.date_from.date().toPyDate()
+            date_to = self.date_to.date().toPyDate()
+            
+            # Построение графика заселяемости номеров
+            if self.rb_room_occupancy.isChecked():
+                self.plot_room_occupancy(ax, date_from, date_to)
+            # Построение графика дохода по категориям номеров
+            elif self.rb_custom.isChecked():
+                self.plot_revenue_by_category(ax, date_from, date_to)
+            
+            self.canvas.draw()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, f"Произошла ошибка: {e}", 
+                   horizontalalignment='center', verticalalignment='center')
+            self.canvas.draw()
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при построении графика: {e}")
+    
+    def plot_room_occupancy(self, ax, date_from, date_to):
+        """Построение графика заселяемости номеров"""
+        try:
+            # Проверяем, есть ли данные в таблице bookings
+            count_check = session.execute(select(func.count()).select_from(bookings_table)).scalar()
+            
+            if count_check == 0:
+                ax.text(0.5, 0.5, "Нет данных в таблице бронирований", 
+                       horizontalalignment='center', verticalalignment='center')
+                return
+                
+            # Запрос для получения количества занятых номеров по датам
+            query = text("""
+                SELECT date_trunc('day', checkindate) as check_date, COUNT(*) as count 
+                FROM bookings 
+                WHERE checkindate BETWEEN :date_from AND :date_to
+                GROUP BY date_trunc('day', checkindate)
+                ORDER BY date_trunc('day', checkindate)
+            """)
+            
+            result = session.execute(query, {"date_from": date_from, "date_to": date_to}).fetchall()
+            
+            if not result:
+                ax.text(0.5, 0.5, "Нет данных за выбранный период", 
+                       horizontalalignment='center', verticalalignment='center')
+                return
+            
+            dates = [row[0] for row in result]
+            counts = [row[1] for row in result]
+            
+            # В зависимости от выбранного типа графика
+            if self.rb_histogram.isChecked():
+                ax.bar(dates, counts, width=0.6)
+                ax.set_title("Гистограмма заселяемости номеров")
+            elif self.rb_linear.isChecked():
+                ax.plot(dates, counts, 'o-', linewidth=2)
+                ax.set_title("Линейный график заселяемости номеров")
+            elif self.rb_pie.isChecked():
+                # Для круговой диаграммы сгруппируем данные иначе
+                # Получим заселяемость по категориям номеров
+                cat_query = text("""
+                    SELECT c.name, COUNT(*) as count 
+                    FROM bookings b
+                    JOIN roomcategories c ON b.categoryid = c.categoryid
+                    WHERE b.checkindate BETWEEN :date_from AND :date_to
+                    GROUP BY c.name
+                """)
+                cat_result = session.execute(cat_query, {"date_from": date_from, "date_to": date_to}).fetchall()
+                
+                if cat_result:
+                    labels = [row[0] for row in cat_result]
+                    sizes = [row[1] for row in cat_result]
+                    ax.pie(sizes, labels=labels, autopct='%1.1f%%', shadow=True, startangle=90)
+                    ax.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
+                    ax.set_title("Круговая диаграмма заселяемости по категориям")
+                else:
+                    ax.text(0.5, 0.5, "Нет данных за выбранный период", 
+                           horizontalalignment='center', verticalalignment='center')
+            
+            ax.set_xlabel("Дата")
+            ax.set_ylabel("Количество заселений")
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+            plt.tight_layout()
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            ax.text(0.5, 0.5, f"Ошибка при построении графика: {e}", 
+                   horizontalalignment='center', verticalalignment='center')
+    
+    def plot_revenue_by_category(self, ax, date_from, date_to):
+        """Построение графика дохода по категориям номеров"""
+        try:
+            # Проверяем, есть ли данные в таблице bookings
+            count_check = session.execute(select(func.count()).select_from(bookings_table)).scalar()
+            
+            if count_check == 0:
+                ax.text(0.5, 0.5, "Нет данных в таблице бронирований", 
+                       horizontalalignment='center', verticalalignment='center')
+                return
+            
+            # Проверяем, есть ли у нас колонка totalamount
+            try:
+                # Пробуем получить колонку totalamount
+                session.execute(select(bookings_table.c.totalamount).limit(1))
+                has_totalamount = True
+            except Exception:
+                has_totalamount = False
+                
+            if has_totalamount:
+                # Запрос для получения дохода по категориям номеров
+                query = text("""
+                    SELECT c.name, SUM(b.totalamount) as total 
+                    FROM bookings b
+                    JOIN roomcategories c ON b.categoryid = c.categoryid
+                    WHERE b.checkindate BETWEEN :date_from AND :date_to
+                    GROUP BY c.name
+                    ORDER BY total DESC
+                """)
+            else:
+                # Альтернативный запрос без поля totalamount (просто подсчет количества бронирований)
+                query = text("""
+                    SELECT c.name, COUNT(*) as count 
+                    FROM bookings b
+                    JOIN roomcategories c ON b.categoryid = c.categoryid
+                    WHERE b.checkindate BETWEEN :date_from AND :date_to
+                    GROUP BY c.name
+                    ORDER BY count DESC
+                """)
+            
+            result = session.execute(query, {"date_from": date_from, "date_to": date_to}).fetchall()
+            
+            if not result:
+                ax.text(0.5, 0.5, "Нет данных за выбранный период", 
+                       horizontalalignment='center', verticalalignment='center')
+                return
+            
+            categories = [row[0] for row in result]
+            values = [row[1] if row[1] else 0 for row in result]
+            
+            y_label = "Доход" if has_totalamount else "Количество бронирований"
+            
+            # В зависимости от выбранного типа графика
+            if self.rb_histogram.isChecked():
+                ax.bar(categories, values)
+                ax.set_title(f"Гистограмма по категориям номеров")
+            elif self.rb_linear.isChecked():
+                ax.plot(categories, values, 'o-', linewidth=2)
+                ax.set_title(f"Линейный график по категориям номеров")
+            elif self.rb_pie.isChecked():
+                ax.pie(values, labels=categories, autopct='%1.1f%%', shadow=True, startangle=90)
+                ax.axis('equal')
+                ax.set_title(f"Круговая диаграмма по категориям номеров")
+            
+            ax.set_xlabel("Категория номера")
+            ax.set_ylabel(y_label)
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
+            plt.tight_layout()
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            ax.text(0.5, 0.5, f"Ошибка при построении графика: {e}", 
+                   horizontalalignment='center', verticalalignment='center')
 
 class SQLTableModel(QAbstractTableModel):
     """Модель для отображения SQL-данных в QTableView"""
@@ -69,7 +324,8 @@ class HotelApp(QWidget):
         self.btn_rooms = QPushButton("Номерной фонд")
         self.btn_services = QPushButton("Доп. услуги")
         self.btn_bookings = QPushButton("Бронирования")
-        for btn in [self.btn_clients, self.btn_rooms, self.btn_services, self.btn_bookings]:
+        self.btn_charts = QPushButton("Графики")
+        for btn in [self.btn_clients, self.btn_rooms, self.btn_services, self.btn_bookings, self.btn_charts]:
             left_panel.addWidget(btn)
         left_panel.addStretch()
         content_layout.addLayout(left_panel)
@@ -110,6 +366,7 @@ class HotelApp(QWidget):
         self.btn_rooms.clicked.connect(self.show_rooms)
         self.btn_services.clicked.connect(self.show_services)
         self.btn_bookings.clicked.connect(self.show_bookings)
+        self.btn_charts.clicked.connect(self.show_charts)
         self.search_line.textChanged.connect(self.filter_table)
         self.btn_advanced_filter.clicked.connect(self.show_advanced_filter)
         self.btn_reset_filter.clicked.connect(self.reset_filters)
@@ -271,6 +528,14 @@ class HotelApp(QWidget):
         self.model = SQLTableModel(data, headers)
         self.table.setModel(self.model)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+
+    def show_charts(self):
+        """Отображение окна с графиками"""
+        try:
+            charts_window = ChartsWindow(self)
+            charts_window.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Ошибка при открытии окна графиков: {e}")
 
     def filter_table(self, text):
         """Фильтрация по всей таблице простым поиском текста"""
